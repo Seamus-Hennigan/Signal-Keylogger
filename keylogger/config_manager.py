@@ -5,23 +5,21 @@ Handles saving and laoding configuration settings with encrypted passowrds
 
 import json
 import os
-import pathlib import path
 from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
-from cryptography.hazmat.backends import default_backend
-import base64
 
 
 class ConfigManager:
 
 
-    def __int__(self, config_file="config.json", key_file=".config.key"):
+    def __init__(self, config_file="config.json", key_file=".config.key"):
+        print("[ConfigManager] Initializing...")
         self.config_file = config_file
         self.key_file = key_file
+        print("[ConfigManager] Loading Cipher...")
         self.cipher = self._load_or_create_cipher()
+        print("[ConfigManager] Loading Config...")
         self.config = self.load_config()
-
+        print(f"[ConfigManager] Config loaded: {self.config}")
 
     def _load_or_create_cipher(self):
         if os.path.exists(self.key_file):
@@ -46,62 +44,61 @@ class ConfigManager:
             return Fernet(key)
 
 
-        def load_config(self):
-            if os.path.exists(self.config_file):
-                try:
-                    with open(self.config_file, 'r') as f:
-                        config = json.load(f)
-                    print(f"[+] Configuration loaded from {self.config_file}")
-                    return config
-                except Exception as e:
-                    print(f"[!] Error loading config: {e}")
-                    return self._defualt_config()
-            else:
-                print(f"[*] No configuration file found, using defaults")
-                return self._default_config()
-
-
-        def save_config(self):
+    def load_config(self):
+        if os.path.exists(self.config_file):
             try:
-                with open(self.config, 'w') as f:
-                    json.dump(self.config, f, indent=4)
-                print(f"[+] Configuration saved to {self.config_file}")
-                return True
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                print(f"[+] Configuration loaded from {self.config_file}")
+                return config
             except Exception as e:
-                print(f"[!] Error saving config: {e}")
-                return False
+                print(f"[!] Error loading config: {e}")
+                return self._defualt_config()
+        else:
+            print(f"[*] No configuration file found, using defaults")
+            return self._default_config()
 
 
-        def _defualt_config(self):
-            return {
-                "server_settings": {
-                    "server_ip": "127.0.0.1",
-                    "server_port": 10000,
-                    "client_name": "client1"
-                },
-                "email_info": {
-                    "sender_email": "",
-                    "app_password_encrypted": "",
-                    "recipient_email": "",
-                    "smtp_server": "smtp.gmail.com",
-                    "smtp_port": 587
-                },
-                "version": "1.1"
+    def save_config(self):
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=4)
+            print(f"[+] Configuration saved to {self.config_file}")
+            return True
+        except Exception as e:
+            print(f"[!] Error saving config: {e}")
+            return False
+
+
+    def _default_config(self):
+        return {
+            "server_settings": {
+                "server_ip": "127.0.0.1",
+                "server_port": 10000,
+                "client_name": "client1"
+            },
+            "email_info": {
+                "sender_email": "",
+                "app_password_encrypted": "",
+                "recipient_email": "",
+                "smtp_server": "smtp.gmail.com",
+                "smtp_port": 587
+            },
+            "version": "1.1"
             }
 
-        def _encrypt_password(self, password):
-            if not password:
-                return ""
-            try:
-                encrypted = self.cipher.encrypt(password.encode())
-                return encrypted.decode()
-            except Exception as e:
-                print(f"[!] Error encrypting password: {e}")
-                return ""
+    def _encrypt_password(self, password):
+        if not password:
+            return ""
+        try:
+            encrypted = self.cipher.encrypt(password.encode())
+            return encrypted.decode()
+        except Exception as e:
+            print(f"[!] Error encrypting password: {e}")
+            return ""
 
 
-        def _decrypt_password(self, encrypted_password):
-        """Decrypt password using Fernet encryption"""
+    def _decrypt_password(self, encrypted_password):
         if not encrypted_password:
             return ""
         try:
@@ -200,22 +197,3 @@ def get_config_manager():
     if _config_manager is None:
         _config_manager = ConfigManager()
     return _config_manager
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
