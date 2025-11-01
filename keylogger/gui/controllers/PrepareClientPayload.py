@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Form implementation generated from reading ui file 'SetComputerInfo.ui'
+# Form implementation generated from reading ui file 'PrepareClientPayload.ui'
 #
 # Created by: PyQt5 UI code generator 5.15.11
 #
@@ -11,12 +11,12 @@
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 
-class Ui_SetComputerInfo(object):
-    def setupUi(self, SetComputerInfo):
-        SetComputerInfo.setObjectName("SetComputerInfo")
-        SetComputerInfo.resize(400, 300)
-        self.widget = QtWidgets.QWidget(SetComputerInfo)
-        self.widget.setGeometry(QtCore.QRect(130, 30, 141, 188))
+class Ui_PrepareClientPayload(object):
+    def setupUi(self, PrepareClientPayload):
+        PrepareClientPayload.setObjectName("PrepareClientPayload")
+        PrepareClientPayload.resize(400, 300)
+        self.widget = QtWidgets.QWidget(PrepareClientPayload)
+        self.widget.setGeometry(QtCore.QRect(130, 30, 141, 138))
         self.widget.setObjectName("widget")
         self.verticalLayout_2 = QtWidgets.QVBoxLayout(self.widget)
         self.verticalLayout_2.setContentsMargins(0, 0, 0, 0)
@@ -35,24 +35,17 @@ class Ui_SetComputerInfo(object):
         self.lineEdit_2 = QtWidgets.QLineEdit(self.widget)
         self.lineEdit_2.setObjectName("lineEdit_2")
         self.verticalLayout.addWidget(self.lineEdit_2)
-        self.label_3 = QtWidgets.QLabel(self.widget)
-        self.label_3.setObjectName("label_3")
-        self.verticalLayout.addWidget(self.label_3)
-        self.lineEdit_3 = QtWidgets.QLineEdit(self.widget)
-        self.lineEdit_3.setObjectName("lineEdit_3")
-        self.verticalLayout.addWidget(self.lineEdit_3)
         self.verticalLayout_2.addLayout(self.verticalLayout)
         self.pushButton = QtWidgets.QPushButton(self.widget)
         self.pushButton.setObjectName("pushButton")
         self.verticalLayout_2.addWidget(self.pushButton)
 
-        self.retranslateUi(SetComputerInfo)
-        QtCore.QMetaObject.connectSlotsByName(SetComputerInfo)
+        self.retranslateUi(PrepareClientPayload)
+        QtCore.QMetaObject.connectSlotsByName(PrepareClientPayload)
 
-    def retranslateUi(self, SetComputerInfo):
+    def retranslateUi(self, PrepareClientPayload):
         _translate = QtCore.QCoreApplication.translate
-        SetComputerInfo.setWindowTitle(_translate("SetComputerInfo", "Set Computer Info"))
-        self.label.setText(_translate("SetComputerInfo", "IP Address"))
-        self.label_2.setText(_translate("SetComputerInfo", "Username"))
-        self.label_3.setText(_translate("SetComputerInfo", "Password"))
-        self.pushButton.setText(_translate("SetComputerInfo", "Save"))
+        PrepareClientPayload.setWindowTitle(_translate("PrepareClientPayload", "Prepare Client Payload"))
+        self.label.setText(_translate("PrepareClientPayload", "Server IP"))
+        self.label_2.setText(_translate("PrepareClientPayload", "Server Port"))
+        self.pushButton.setText(_translate("PrepareClientPayload", "Generate Payload"))
