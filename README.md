@@ -43,11 +43,9 @@ The developers of this software:
 - [Architecture](#architecture)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Configuration](#configuration)
 - [Technical Details](#technical-details)
 - [Troubleshooting](#troubleshooting)
 - [Contributing](#contributing)
-- [Roadmap](#roadmap)
 
 ---
 
@@ -165,63 +163,6 @@ python keylogger/program.py
 5. **Theme** - Use Settings menu to switch between light/dark mode
 
 ---
-
-## ⚙️ Configuration
-
-Configuration is stored in `config.json` (auto-generated on first run).
-
-### Server Configuration
-```json
-{
-  "server": {
-    "host": "0.0.0.0",          // Listen on all interfaces
-    "port": 10000,               // Port to listen on
-    "listen_backlog": 1          // Max pending connections
-  }
-}
-```
-
-### Client Configuration
-```json
-{
-  "client": {
-    "server_host": "127.0.0.1",  // Server IP address
-    "server_port": 10000,         // Server port
-    "heartbeat_interval": 30,     // Seconds between heartbeats
-    "reconnect_delay": 5,         // Seconds before reconnect attempt
-    "connection_timeout": 5       // Connection timeout in seconds
-  }
-}
-```
-
-### Keylogger Configuration
-```json
-{
-  "keylogger": {
-    "buffer_size": 4096,          // Socket buffer size
-    "send_on_enter": true         // Send on Enter key vs immediate
-  }
-}
-```
-
-### GUI Configuration
-```json
-{
-  "gui": {
-    "theme": "dark",                          // "light" or "dark"
-    "window_title": "Signal Keylogger Dashboard"
-  }
-}
-```
-
-### Editing Configuration
-
-1. Stop all running instances
-2. Edit `config.json` with any text editor
-3. Restart the applications
-
----
-
 
 ## 🔧 Technical Details
 
@@ -390,28 +331,6 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 - ❌ Warranty disclaimer
 
 **Key Requirement:** Any modified or distributed versions must also be open source under GPL 3.0.
-
----
-
-## 🔮 Roadmap
-
-### Version 1.1 (Planned)
-- [ ] SSL/TLS encryption for network traffic
-- [ ] Basic authentication mechanism
-- [ ] Log export functionality (CSV, TXT)
-- [ ] File logging with rotation
-
-### Version 1.2 (Planned)
-- [ ] Multi-client support
-- [ ] Screenshot capture capability
-- [ ] Process monitoring
-- [ ] Clipboard monitoring
-
-### Version 2.0 (Future)
-- [ ] Web-based dashboard option
-- [ ] Database storage (SQLite/PostgreSQL)
-- [ ] Advanced filtering and search
-- [ ] Configurable alerts/notifications
 
 ---
 
